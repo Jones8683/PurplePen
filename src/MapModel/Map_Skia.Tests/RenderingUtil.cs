@@ -15,6 +15,7 @@ namespace Map_Skia.Tests
     using TestingUtils;
     using Map_Skia;
     using System.Diagnostics;
+    using NUnit.Framework;
 
 
     public static class RenderingUtil
@@ -42,20 +43,45 @@ namespace Map_Skia.Tests
             }
         }
 
-        static Skia_Bitmap RenderBitmap(Map map, Size bitmapSize, RectangleF mapArea, RenderOptions renderOptions, bool usePatternBitmaps, bool useOverprinting, bool antiAlias, float intensity)
+        // Same as RenderingTest, but draws into a RecordingGraphicsTarget, then plays the recording back twice
+        // into two separate bitmaps, each of which is compared against the baseline.
+        public static void RecordingRenderingTest(int width, RectangleF drawingRectangle, bool inverted, string pngFileName, Action<IGraphicsTarget> draw)
+        {
+            using (RecordingGraphicsTarget recorder = new RecordingGraphicsTarget()) {
+                draw(recorder);
+                recorder.EndRecording();
+
+                for (int i = 0; i < 2; ++i) {
+                    RenderingTest(width, drawingRectangle, inverted, pngFileName, grTarget => recorder.Playback(grTarget));
+                }
+            }
+        }
+
+        static Skia_Bitmap RenderBitmap(Map map, Size bitmapSize, RectangleF mapArea, RenderOptions renderOptions, bool usePatternBitmaps, bool useOverprinting, bool antiAlias, float intensity, bool useRecording = false)
         {
             var grTarget = new Skia_BitmapGraphicsTarget(bitmapSize.Width, bitmapSize.Height, false, CmykColor.FromCmyk(0, 0, 0, 0), mapArea, true, null, intensity);
             using (grTarget) {
-                grTarget.PushAntiAliasing(antiAlias);
-
                 RenderOptions renderOpts = renderOptions;
                 renderOpts.usePatternBitmaps = usePatternBitmaps;
                 renderOpts.renderTemplates = RenderTemplateOption.MapAndTemplates;
                 renderOpts.blendOverprintedColors = useOverprinting;
                 renderOpts.minResolution = mapArea.Width / (float)bitmapSize.Width;
 
-                using (map.Read())
-                    map.Draw(grTarget, mapArea, renderOpts, null);
+                if (useRecording) {
+                    // Record the drawing, then play it back onto the bitmap.
+                    using (RecordingGraphicsTarget recorder = new RecordingGraphicsTarget(intensity)) {
+                        recorder.PushAntiAliasing(antiAlias);
+                        using (map.Read())
+                            map.Draw(recorder, mapArea, renderOpts, null);
+                        recorder.EndRecording();
+                        recorder.Playback(grTarget);
+                    }
+                }
+                else {
+                    grTarget.PushAntiAliasing(antiAlias);
+                    using (map.Read())
+                        map.Draw(grTarget, mapArea, renderOpts, null);
+                }
 
                 return ((Skia_Bitmap)grTarget.FinishBitmap());
             }
@@ -68,9 +94,36 @@ namespace Map_Skia.Tests
             BitmapTestUtil.CompareBitmapBaseline(skBitmap, baselineFileName, maxPixelDiff);
         }
 
-        // Verifies a test file. Returns true on success, false on failure. In the failure case, 
+        // Render the map and compare against the baseline. If alsoTestRecording is true, then also render
+        // the map through a RecordingGraphicsTarget (played back onto a bitmap) and compare that against the
+        // same baseline. The non-recording rendering is checked first, so a failure in the recorded rendering
+        // indicates a problem with recording/playback.
+        static void RenderAndCompare(Map map, Size size, RectangleF mapArea, RenderOptions renderOptions, bool usePatternBitmaps, bool useOverprinting, bool antiAlias, float intensity,
+                                     string pngFileName, int maxPixelDiff, bool alsoTestRecording)
+        {
+            Skia_Bitmap bitmapNew = RenderBitmap(map, size, mapArea, renderOptions, usePatternBitmaps, useOverprinting, antiAlias, intensity);
+            CompareBitmapBaseline(bitmapNew, pngFileName, maxPixelDiff);
+            bitmapNew.Dispose();
+
+            if (alsoTestRecording) {
+                Skia_Bitmap bitmapRecorded = RenderBitmap(map, size, mapArea, renderOptions, usePatternBitmaps, useOverprinting, antiAlias, intensity, true);
+                try {
+                    CompareBitmapBaseline(bitmapRecorded, pngFileName, maxPixelDiff);
+                }
+                catch (AssertionException) {
+                    Assert.Fail($"Rendering through RecordingGraphicsTarget did not match baseline '{Path.GetFileName(pngFileName)}', but direct rendering did.");
+                }
+                finally {
+                    bitmapRecorded.Dispose();
+                }
+            }
+        }
+
+        // Verifies a test file. Returns true on success, false on failure. In the failure case,
         // a difference bitmap is written out.
-        public static bool VerifyTestFile(string filename, RenderOptions renderOptions, bool usePatternBitmaps, bool useOverprinting, bool testLightenedColor, bool roundtripToOcadFile, bool antiAlias, int minOcadVersion, int maxOcadVersion, int maxPixelDiff)
+        // If alsoTestRecording is true, the map is also drawn through a RecordingGraphicsTarget and played back,
+        // and that rendering is also compared against the baseline (except for the OCAD round-trip renderings).
+        public static bool VerifyTestFile(string filename, RenderOptions renderOptions, bool usePatternBitmaps, bool useOverprinting, bool testLightenedColor, bool roundtripToOcadFile, bool antiAlias, int minOcadVersion, int maxOcadVersion, int maxPixelDiff, bool alsoTestRecording = false)
         {
 
             string pngFileName;
@@ -111,21 +164,12 @@ namespace Map_Skia.Tests
             Map map = new Map(new Skia_TextMetrics(), new Skia_FileLoader(directoryName));
             InputOutput.ReadFile(mapFileName, map);
 
-            Stopwatch sw = new Stopwatch();
-            sw.Start();
-
-            // Draw into a new bitmap.
-            Skia_Bitmap bitmapNew = RenderBitmap(map, size, mapArea, renderOptions, usePatternBitmaps, useOverprinting, antiAlias, 1.0F);
-            sw.Stop();
-            //Console.WriteLine("Rendered bitmap '{0}' to output '{4}' rect={1} size={2} in {3} ms", mapFileName, mapArea, size, sw.ElapsedMilliseconds, pngFileName);
-
-            CompareBitmapBaseline(bitmapNew, pngFileName, maxPixelDiff);
+            // Draw into a new bitmap and compare.
+            RenderAndCompare(map, size, mapArea, renderOptions, usePatternBitmaps, useOverprinting, antiAlias, 1.0F, pngFileName, maxPixelDiff, alsoTestRecording);
 
             if (testLightenedColor) {
                 string lightenedPngFileName = Path.Combine(Path.GetDirectoryName(pngFileName), Path.GetFileNameWithoutExtension(pngFileName) + "_light.png");
-                Skia_Bitmap bitmapLight = RenderBitmap(map, size, mapArea, renderOptions, usePatternBitmaps, useOverprinting, antiAlias, 0.4F);
-                CompareBitmapBaseline(bitmapLight, lightenedPngFileName, maxPixelDiff);
-                bitmapLight.Dispose();
+                RenderAndCompare(map, size, mapArea, renderOptions, usePatternBitmaps, useOverprinting, antiAlias, 0.4F, lightenedPngFileName, maxPixelDiff, alsoTestRecording);
             }
 
             if (roundtripToOcadFile) {
@@ -138,15 +182,14 @@ namespace Map_Skia.Tests
                     InputOutput.ReadFile(ocadFileName, map);
 
                     // Draw into a new bitmap.
-                    bitmapNew = RenderBitmap(map, size, mapArea, renderOptions, usePatternBitmaps, useOverprinting, antiAlias, 1.0F);
+                    Skia_Bitmap bitmapNew = RenderBitmap(map, size, mapArea, renderOptions, usePatternBitmaps, useOverprinting, antiAlias, 1.0F);
 
                     CompareBitmapBaseline(bitmapNew, pngFileName, maxPixelDiff);
+                    bitmapNew.Dispose();
 
                     File.Delete(ocadFileName);
                 }
             }
-
-            bitmapNew.Dispose();
 
             return true;
         }
